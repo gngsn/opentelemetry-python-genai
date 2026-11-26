@@ -180,18 +180,23 @@ class _ScopedTextStream(_ObjectProxy):
     ) -> None:
         super().__init__(wrapped)
         self._self_scope = scope
+        # A close ends this text view only: the SDK's parent stream stays
+        # readable through its helpers, so the exhaustion that follows must
+        # leave the stream open for them.
+        self._self_closed = False
 
     def __iter__(self) -> Iterator[str]:
         return self
 
-    def __next__(self) -> str:
+    def _read(self, read: Callable[[], str]) -> str:
         with self._self_scope._execution_context():
             try:
-                return next(self.__wrapped__)
+                return read()
             except StopIteration:
-                # The response is complete here, so the stream ends now: a
-                # caller error after the loop must not fail the span.
-                self._self_scope._finalize_success()
+                if not self._self_closed:
+                    # The response is complete here, so the stream ends now: a
+                    # caller error after the loop must not fail the span.
+                    self._self_scope._finalize_success()
             except BaseException as error:
                 # Finalize through the wrapper before ``activate()`` fails the
                 # invocation, so the SDK snapshot is still recorded.
@@ -199,9 +204,23 @@ class _ScopedTextStream(_ObjectProxy):
                 raise
         raise StopIteration
 
+    def __next__(self) -> str:
+        return self._read(lambda: next(self.__wrapped__))
+
+    def send(self, value: Any) -> str:
+        """Resume the SDK generator, so it reads like ``__next__`` does."""
+        source = cast("Generator[str, Any, Any]", self.__wrapped__)
+        return self._read(lambda: source.send(value))
+
+    def throw(self, *args: Any) -> str:
+        """Throw into the SDK generator, so it reads like ``__next__`` does."""
+        source = cast("Generator[str, Any, Any]", self.__wrapped__)
+        return self._read(lambda: source.throw(*args))
+
     def close(self) -> None:
         with self._self_scope._execution_context():
             try:
+                self._self_closed = True
                 _close_text_source(self.__wrapped__)
             except BaseException as error:
                 self._self_scope._finalize_failure(error)
@@ -218,25 +237,42 @@ class _AsyncScopedTextStream(_ObjectProxy):
     ) -> None:
         super().__init__(wrapped)
         self._self_scope = scope
+        # See ``_ScopedTextStream.__init__``.
+        self._self_closed = False
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self
 
-    async def __anext__(self) -> str:
+    async def _read(self, read: Callable[[], Awaitable[str]]) -> str:
         with self._self_scope._execution_context():
             try:
-                return await anext(self.__wrapped__)
+                return await read()
             except StopAsyncIteration:
-                # See ``_ScopedTextStream.__next__``.
-                self._self_scope._finalize_success()
+                # See ``_ScopedTextStream._read``.
+                if not self._self_closed:
+                    self._self_scope._finalize_success()
             except BaseException as error:
                 self._self_scope._finalize_failure(error)
                 raise
         raise StopAsyncIteration
 
+    async def __anext__(self) -> str:
+        return await self._read(lambda: anext(self.__wrapped__))
+
+    async def asend(self, value: Any) -> str:
+        """See ``_ScopedTextStream.send``."""
+        source = cast("AsyncGenerator[str, Any]", self.__wrapped__)
+        return await self._read(lambda: source.asend(value))
+
+    async def athrow(self, *args: Any) -> str:
+        """See ``_ScopedTextStream.throw``."""
+        source = cast("AsyncGenerator[str, Any]", self.__wrapped__)
+        return await self._read(lambda: source.athrow(*args))
+
     async def aclose(self) -> None:
         with self._self_scope._execution_context():
             try:
+                self._self_closed = True
                 await _aclose_text_source(self.__wrapped__)
             except BaseException as error:
                 self._self_scope._finalize_failure(error)
@@ -481,8 +517,8 @@ class MessagesStreamWrapper(
         return cast("Iterator[str]", self._self_text_stream)
 
     def _scoped_helper(
-        self, name: str, helper: Callable[..., Any]
-    ) -> Callable[..., Any]:
+        self, name: str, helper: Callable[[], Any]
+    ) -> Callable[[], Any]:
         # Only draining reads the response; the final-message helpers then
         # raise their own usage errors on a successful response
         # (``get_final_text()`` on a reply with no text block), which must not
@@ -494,12 +530,15 @@ class MessagesStreamWrapper(
         )
 
         @functools.wraps(helper)
-        def scoped(*args: Any, **kwargs: Any) -> Any:
+        def scoped() -> Any:
+            # The SDK helper takes no arguments, so the wrapper takes none
+            # either: an invalid call raises ``TypeError`` here, before it can
+            # drain the response or end the span.
             result: Any = None
             with self._execution_context():
                 try:
                     if drain is None:
-                        result = helper(*args, **kwargs)
+                        result = helper()
                     else:
                         drain()
                 except BaseException as error:
@@ -508,7 +547,7 @@ class MessagesStreamWrapper(
                 # The response is complete here, so the stream ends now: a
                 # caller error after the helper must not fail the span.
                 self._finalize_success()
-            return result if drain is None else helper(*args, **kwargs)
+            return result if drain is None else helper()
 
         return scoped
 
@@ -595,8 +634,8 @@ class AsyncMessagesStreamWrapper(
         return cast("AsyncIterator[str]", self._self_text_stream)
 
     def _scoped_helper(
-        self, name: str, helper: Callable[..., Awaitable[Any]]
-    ) -> Callable[..., Awaitable[Any]]:
+        self, name: str, helper: Callable[[], Awaitable[Any]]
+    ) -> Callable[[], Awaitable[Any]]:
         # See ``MessagesStreamWrapper._scoped_helper``.
         drain = (
             None
@@ -605,20 +644,26 @@ class AsyncMessagesStreamWrapper(
         )
 
         @functools.wraps(helper)
-        async def scoped(*args: Any, **kwargs: Any) -> Any:
-            result: Any = None
-            with self._execution_context():
-                try:
-                    if drain is None:
-                        result = await helper(*args, **kwargs)
-                    else:
-                        await drain()
-                except BaseException as error:
-                    self._finalize_failure(error)
-                    raise
-                # See ``MessagesStreamWrapper._scoped_helper``.
-                self._finalize_success()
-            return result if drain is None else await helper(*args, **kwargs)
+        def scoped() -> Awaitable[Any]:
+            # Wrapping the coroutine keeps the zero-argument signature: an
+            # invalid call raises ``TypeError`` here, not when awaited, and so
+            # cannot drain the response or end the span.
+            async def run() -> Any:
+                result: Any = None
+                with self._execution_context():
+                    try:
+                        if drain is None:
+                            result = await helper()
+                        else:
+                            await drain()
+                    except BaseException as error:
+                        self._finalize_failure(error)
+                        raise
+                    # See ``MessagesStreamWrapper._scoped_helper``.
+                    self._finalize_success()
+                return result if drain is None else await helper()
+
+            return run()
 
         return scoped
 

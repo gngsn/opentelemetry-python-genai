@@ -755,6 +755,222 @@ async def test_async_stream_helper_activates(
     assert context.get_current() is before
 
 
+@pytest.mark.parametrize("helper", _HELPERS)
+def test_sync_stream_helper_rejects_arguments_before_reading(
+    tracer_provider, logger_provider, meter_provider, span_exporter, helper
+) -> None:
+    """A helper call with an argument raises before it can read the stream."""
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    source = _HelperStream(invocation)
+    stream = MessagesStreamWrapper(source, invocation, False)
+
+    with pytest.raises(TypeError, match="unexpected"):
+        getattr(stream, helper)(unexpected=True)
+
+    assert not source._drained
+    assert span_exporter.get_finished_spans() == ()
+
+    getattr(stream, helper)()
+    assert source._drained
+    assert len(span_exporter.get_finished_spans()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", _HELPERS)
+async def test_async_stream_helper_rejects_arguments_when_called(
+    tracer_provider, logger_provider, meter_provider, span_exporter, helper
+) -> None:
+    """An argument is rejected when the helper is called, not when awaited."""
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    source = _AsyncHelperStream(invocation)
+    stream = AsyncMessagesStreamWrapper(source, invocation, False)
+
+    with pytest.raises(TypeError, match="unexpected"):
+        getattr(stream, helper)(unexpected=True)
+
+    assert not source._drained
+    assert span_exporter.get_finished_spans() == ()
+
+    await getattr(stream, helper)()
+    assert source._drained
+    assert len(span_exporter.get_finished_spans()) == 1
+
+
+# --- the scoped text stream resumed by the caller ----------------------------
+
+
+class _InteractiveTextStream:
+    """A ``text_stream`` generator the caller resumes with ``send``/``throw``.
+
+    The SDK's ``text_stream`` is a plain generator, so a caller may send into
+    it or throw at it; every resume reads the parent stream like ``next``.
+    """
+
+    def __init__(
+        self, invocation: Any, error: BaseException | None = None
+    ) -> None:
+        self._invocation = invocation
+        self._error = error
+        self.text_stream = self._texts()
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(())
+
+    def close(self) -> None:
+        pass
+
+    def _texts(self) -> Iterator[str]:
+        _assert_invocation_current(self._invocation)
+        try:
+            received = yield "hello"
+        except ValueError:
+            # ``throw`` resumes the generator here, so this read must run under
+            # the invocation too.
+            _assert_invocation_current(self._invocation)
+            yield "recovered"
+            return
+        _assert_invocation_current(self._invocation)
+        if self._error is not None:
+            raise self._error
+        yield received
+
+
+class _AsyncInteractiveTextStream:
+    """Async counterpart of ``_InteractiveTextStream``."""
+
+    def __init__(
+        self, invocation: Any, error: BaseException | None = None
+    ) -> None:
+        self._invocation = invocation
+        self._error = error
+        self.text_stream = self._texts()
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self._events()
+
+    async def _events(self) -> AsyncIterator[Any]:
+        return
+        yield
+
+    async def close(self) -> None:
+        pass
+
+    async def _texts(self) -> AsyncIterator[str]:
+        await asyncio.sleep(0)
+        _assert_invocation_current(self._invocation)
+        try:
+            received = yield "hello"
+        except ValueError:
+            await asyncio.sleep(0)
+            _assert_invocation_current(self._invocation)
+            yield "recovered"
+            return
+        await asyncio.sleep(0)
+        _assert_invocation_current(self._invocation)
+        if self._error is not None:
+            raise self._error
+        yield received
+
+
+@pytest.mark.parametrize("how", ["send", "throw"])
+def test_sync_text_stream_resume_stays_in_the_invocation(
+    tracer_provider, logger_provider, meter_provider, span_exporter, how
+) -> None:
+    before = context.get_current()
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    stream = MessagesStreamWrapper(
+        _InteractiveTextStream(invocation), invocation, False
+    )
+
+    texts = stream.text_stream
+    assert next(texts) == "hello"
+    if how == "send":
+        assert texts.send("world") == "world"
+    else:
+        assert texts.throw(ValueError("caught")) == "recovered"
+
+    assert context.get_current() is before
+    assert span_exporter.get_finished_spans() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["send", "throw"])
+async def test_async_text_stream_resume_stays_in_the_invocation(
+    tracer_provider, logger_provider, meter_provider, span_exporter, how
+) -> None:
+    before = context.get_current()
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    stream = AsyncMessagesStreamWrapper(
+        _AsyncInteractiveTextStream(invocation), invocation, False
+    )
+
+    texts = stream.text_stream
+
+    async def resume() -> str:
+        assert await anext(texts) == "hello"
+        if how == "send":
+            return await texts.asend("world")
+        return await texts.athrow(ValueError("caught"))
+
+    expected = "world" if how == "send" else "recovered"
+    assert await asyncio.create_task(resume()) == expected
+    assert context.get_current() is before
+    assert span_exporter.get_finished_spans() == ()
+
+
+@pytest.mark.parametrize("how", ["send", "throw"])
+def test_sync_text_stream_resume_error_fails_the_span(
+    tracer_provider, logger_provider, meter_provider, span_exporter, how
+) -> None:
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    error = ConnectionError("dropped")
+    stream = MessagesStreamWrapper(
+        _InteractiveTextStream(invocation, error), invocation, False
+    )
+
+    texts = stream.text_stream
+    assert next(texts) == "hello"
+    with pytest.raises(ConnectionError, match="dropped"):
+        if how == "send":
+            texts.send("world")
+        else:
+            texts.throw(error)
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert span.attributes is not None
+    assert span.attributes["error.type"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["send", "throw"])
+async def test_async_text_stream_resume_error_fails_the_span(
+    tracer_provider, logger_provider, meter_provider, span_exporter, how
+) -> None:
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    error = ConnectionError("dropped")
+    stream = AsyncMessagesStreamWrapper(
+        _AsyncInteractiveTextStream(invocation, error), invocation, False
+    )
+
+    texts = stream.text_stream
+
+    async def resume() -> None:
+        assert await anext(texts) == "hello"
+        if how == "send":
+            await texts.asend("world")
+        else:
+            await texts.athrow(error)
+
+    with pytest.raises(ConnectionError, match="dropped"):
+        await asyncio.create_task(resume())
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert span.attributes is not None
+    assert span.attributes["error.type"] == "ConnectionError"
+
+
 # --- the scoped text stream closed early by the caller -----------------------
 
 
@@ -937,6 +1153,140 @@ async def test_async_text_stream_close_error_propagates(
     assert span.attributes[GenAIAttributes.GEN_AI_RESPONSE_ID] == "msg_1"
     await stream.close()
     assert len(span_exporter.get_finished_spans()) == 1
+
+
+class _ParentTextStream:
+    """A ``MessageStream`` stand-in whose text view and helpers share a stream.
+
+    ``get_final_message()`` drains through ``until_done()``, which the SDK keeps
+    readable after the caller closed ``text_stream``.
+    """
+
+    current_message_snapshot = _start_event().message
+
+    def __init__(self, invocation: Any, drained: list[str]) -> None:
+        self._invocation = invocation
+        self._drained = drained
+        self.text_stream = self._texts()
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(())
+
+    def close(self) -> None:
+        pass
+
+    def _texts(self) -> Iterator[str]:
+        _assert_invocation_current(self._invocation)
+        yield "hello"
+        _assert_invocation_current(self._invocation)
+        yield " world"
+
+    def until_done(self) -> None:
+        _assert_invocation_current(self._invocation)
+        self._drained.append("until_done")
+
+    def get_final_message(self) -> Message:
+        assert self._drained
+        return _start_event().message
+
+
+class _AsyncParentTextStream:
+    """Async counterpart of ``_ParentTextStream``."""
+
+    current_message_snapshot = _start_event().message
+
+    def __init__(self, invocation: Any, drained: list[str]) -> None:
+        self._invocation = invocation
+        self._drained = drained
+        self.text_stream = self._texts()
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self._events()
+
+    async def _events(self) -> AsyncIterator[Any]:
+        return
+        yield
+
+    async def close(self) -> None:
+        pass
+
+    async def _texts(self) -> AsyncIterator[str]:
+        await asyncio.sleep(0)
+        _assert_invocation_current(self._invocation)
+        yield "hello"
+        await asyncio.sleep(0)
+        _assert_invocation_current(self._invocation)
+        yield " world"
+
+    async def until_done(self) -> None:
+        await asyncio.sleep(0)
+        _assert_invocation_current(self._invocation)
+        self._drained.append("until_done")
+
+    async def get_final_message(self) -> Message:
+        await asyncio.sleep(0)
+        assert self._drained
+        return _start_event().message
+
+
+def test_sync_text_stream_closed_then_read_keeps_the_parent_stream(
+    tracer_provider, logger_provider, meter_provider, span_exporter
+) -> None:
+    """Closing the text view must not end the stream its helpers still read."""
+    before = context.get_current()
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    drained: list[str] = []
+    stream = MessagesStreamWrapper(
+        _ParentTextStream(invocation, drained), invocation, False
+    )
+
+    texts = stream.text_stream
+    texts.close()
+    assert list(texts) == []
+    assert context.get_current() is before
+    # The SDK's parent stream is still readable, so the closed text view has
+    # not ended the stream.
+    assert span_exporter.get_finished_spans() == ()
+
+    message = stream.get_final_message()
+    assert message.id == "msg_1"
+    assert drained == ["until_done"]
+    assert context.get_current() is before
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code is not trace.StatusCode.ERROR
+    assert span.attributes is not None
+    assert span.attributes[GenAIAttributes.GEN_AI_RESPONSE_ID] == "msg_1"
+
+
+@pytest.mark.asyncio
+async def test_async_text_stream_closed_then_read_keeps_the_parent_stream(
+    tracer_provider, logger_provider, meter_provider, span_exporter
+) -> None:
+    before = context.get_current()
+    invocation = _invocation(tracer_provider, logger_provider, meter_provider)
+    drained: list[str] = []
+    stream = AsyncMessagesStreamWrapper(
+        _AsyncParentTextStream(invocation, drained), invocation, False
+    )
+
+    texts = stream.text_stream
+    await texts.aclose()
+
+    async def read_closed_view() -> list[str]:
+        return [text async for text in texts]
+
+    assert await asyncio.create_task(read_closed_view()) == []
+    assert context.get_current() is before
+    assert span_exporter.get_finished_spans() == ()
+
+    message = await stream.get_final_message()
+    assert message.id == "msg_1"
+    assert drained == ["until_done"]
+    assert context.get_current() is before
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code is not trace.StatusCode.ERROR
+    assert span.attributes is not None
+    assert span.attributes[GenAIAttributes.GEN_AI_RESPONSE_ID] == "msg_1"
 
 
 def test_stream_helpers_not_advertised_on_plain_streams(
@@ -1404,6 +1754,52 @@ async def test_async_messages_stream_text_stream_close_before_read_closes_the_sd
             assert source.ag_frame is None
             assert _is_current(caller)
     await client.close()
+
+
+def test_sync_messages_stream_closed_text_stream_keeps_the_parent_readable(
+    span_exporter, instrument_no_content
+) -> None:
+    """``texts.close(); list(texts)`` leaves the SDK stream readable."""
+    client = _observed_client([])
+    with client.messages.stream(
+        model=_MODEL, max_tokens=100, messages=_MESSAGES
+    ) as stream:
+        texts = stream.text_stream
+        texts.close()
+        assert list(texts) == []
+
+        # The parent stream is still readable, so nothing has ended yet.
+        assert span_exporter.get_finished_spans() == ()
+        message = stream.get_final_message()
+        assert message.id == "msg_1"
+        assert message.content[0].text == _SSE_TEXT
+    client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
+
+
+@pytest.mark.asyncio
+async def test_async_messages_stream_closed_text_stream_keeps_the_parent_readable(
+    span_exporter, instrument_no_content
+) -> None:
+    client = _async_observed_client([])
+    async with client.messages.stream(
+        model=_MODEL, max_tokens=100, messages=_MESSAGES
+    ) as stream:
+        texts = stream.text_stream
+        await texts.aclose()
+
+        async def read_closed_view() -> list[str]:
+            return [text async for text in texts]
+
+        assert await asyncio.create_task(read_closed_view()) == []
+        assert span_exporter.get_finished_spans() == ()
+        message = await stream.get_final_message()
+        assert message.id == "msg_1"
+        assert message.content[0].text == _SSE_TEXT
+    await client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
 
 
 @pytest.mark.vcr()
