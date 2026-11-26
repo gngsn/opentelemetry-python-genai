@@ -2070,3 +2070,125 @@ async def test_async_streaming_response_error_after_parse_fails_the_span(
     _assert_raw_response_caller_error(
         span_exporter, caller, instrument_with_hook
     )
+
+
+# --- the chat span ends with the response, not with the stream block ----------
+
+
+def _assert_stream_span_succeeded(span_exporter: Any) -> Any:
+    (chat,) = span_exporter.get_finished_spans()
+    assert chat.status.status_code is not trace.StatusCode.ERROR
+    assert chat.attributes is not None
+    assert "error.type" not in chat.attributes
+    assert chat.attributes[GenAIAttributes.GEN_AI_RESPONSE_ID] == "msg_1"
+    return chat
+
+
+@pytest.mark.parametrize("consumer", list(_SYNC_CONSUMERS))
+def test_sync_messages_stream_span_ends_with_the_response(
+    span_exporter, instrument_no_content, consumer
+) -> None:
+    """A helper ends the span once the response is complete, before exit."""
+    client = _observed_client([])
+    with client.messages.stream(
+        model=_MODEL, max_tokens=100, messages=_MESSAGES
+    ) as stream:
+        _SYNC_CONSUMERS[consumer](stream)
+        _assert_stream_span_succeeded(span_exporter)
+    client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", list(_ASYNC_CONSUMERS))
+async def test_async_messages_stream_span_ends_with_the_response(
+    span_exporter, instrument_no_content, consumer
+) -> None:
+    client = _async_observed_client([])
+    async with client.messages.stream(
+        model=_MODEL, max_tokens=100, messages=_MESSAGES
+    ) as stream:
+        await _ASYNC_CONSUMERS[consumer](stream)
+        _assert_stream_span_succeeded(span_exporter)
+    await client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
+
+
+@pytest.mark.parametrize("consumer", list(_SYNC_CONSUMERS))
+def test_sync_messages_stream_caller_error_after_the_response_keeps_the_span_ok(
+    span_exporter, instrument_no_content, consumer
+) -> None:
+    """A caller error after the response arrived does not fail the span."""
+    client = _observed_client([])
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with client.messages.stream(
+            model=_MODEL, max_tokens=100, messages=_MESSAGES
+        ) as stream:
+            _SYNC_CONSUMERS[consumer](stream)
+            raise RuntimeError("caller failed")
+    client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", list(_ASYNC_CONSUMERS))
+async def test_async_messages_stream_caller_error_after_the_response_keeps_the_span_ok(
+    span_exporter, instrument_no_content, consumer
+) -> None:
+    client = _async_observed_client([])
+    with pytest.raises(RuntimeError, match="caller failed"):
+        async with client.messages.stream(
+            model=_MODEL, max_tokens=100, messages=_MESSAGES
+        ) as stream:
+            await _ASYNC_CONSUMERS[consumer](stream)
+            raise RuntimeError("caller failed")
+    await client.close()
+
+    _assert_stream_span_succeeded(span_exporter)
+
+
+def test_sync_get_final_text_without_text_block_escaping_keeps_the_span_ok(
+    span_exporter, instrument_no_content
+) -> None:
+    """The SDK's usage error escaping the block is still the caller's."""
+    client = Anthropic(
+        api_key="test_anthropic_api_key",
+        base_url="http://anthropic.test",
+        max_retries=0,
+        http_client=_http_lib.Client(
+            transport=_http_lib.MockTransport(_tool_use_response)
+        ),
+    )
+    with pytest.raises(RuntimeError, match="text`? (content )?block"):
+        with client.messages.stream(
+            model=_MODEL, max_tokens=100, messages=_MESSAGES
+        ) as stream:
+            stream.get_final_text()
+    client.close()
+
+    _assert_tool_use_span_succeeded(span_exporter)
+
+
+@pytest.mark.asyncio
+async def test_async_get_final_text_without_text_block_escaping_keeps_the_span_ok(
+    span_exporter, instrument_no_content
+) -> None:
+    client = AsyncAnthropic(
+        api_key="test_anthropic_api_key",
+        base_url="http://anthropic.test",
+        max_retries=0,
+        http_client=_http_lib.AsyncClient(
+            transport=_http_lib.MockTransport(_tool_use_response)
+        ),
+    )
+    with pytest.raises(RuntimeError, match="text`? (content )?block"):
+        async with client.messages.stream(
+            model=_MODEL, max_tokens=100, messages=_MESSAGES
+        ) as stream:
+            await stream.get_final_text()
+    await client.close()
+
+    _assert_tool_use_span_succeeded(span_exporter)
