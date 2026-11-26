@@ -162,14 +162,15 @@ async def _aclose_text_source(text_stream: AsyncIterator[str]) -> None:
 class _TextStreamScope(Protocol):
     def _execution_context(self) -> AbstractContextManager[None]: ...
 
+    def _finalize_success(self) -> None: ...
+
     def _finalize_failure(self, error: BaseException) -> None: ...
 
 
 class _ScopedTextStream(_ObjectProxy):
     """The SDK's ``text_stream`` generator, read and closed under the invocation.
 
-    A generator adapter can't stand in for it: closing one before its first
-    read never runs its body, so the SDK generator would stay open.
+    A close must reach the SDK generator even before the first read.
     """
 
     __wrapped__: Iterator[str]
@@ -188,7 +189,9 @@ class _ScopedTextStream(_ObjectProxy):
             try:
                 return next(self.__wrapped__)
             except StopIteration:
-                pass
+                # The response is complete here, so the stream ends now: a
+                # caller error after the loop must not fail the span.
+                self._self_scope._finalize_success()
             except BaseException as error:
                 # Finalize through the wrapper before ``activate()`` fails the
                 # invocation, so the SDK snapshot is still recorded.
@@ -224,7 +227,8 @@ class _AsyncScopedTextStream(_ObjectProxy):
             try:
                 return await anext(self.__wrapped__)
             except StopAsyncIteration:
-                pass
+                # See ``_ScopedTextStream.__next__``.
+                self._self_scope._finalize_success()
             except BaseException as error:
                 self._self_scope._finalize_failure(error)
                 raise
@@ -491,15 +495,20 @@ class MessagesStreamWrapper(
 
         @functools.wraps(helper)
         def scoped(*args: Any, **kwargs: Any) -> Any:
+            result: Any = None
             with self._execution_context():
                 try:
                     if drain is None:
-                        return helper(*args, **kwargs)
-                    drain()
+                        result = helper(*args, **kwargs)
+                    else:
+                        drain()
                 except BaseException as error:
                     self._finalize_failure(error)
                     raise
-            return helper(*args, **kwargs)
+                # The response is complete here, so the stream ends now: a
+                # caller error after the helper must not fail the span.
+                self._finalize_success()
+            return result if drain is None else helper(*args, **kwargs)
 
         return scoped
 
@@ -597,15 +606,19 @@ class AsyncMessagesStreamWrapper(
 
         @functools.wraps(helper)
         async def scoped(*args: Any, **kwargs: Any) -> Any:
+            result: Any = None
             with self._execution_context():
                 try:
                     if drain is None:
-                        return await helper(*args, **kwargs)
-                    await drain()
+                        result = await helper(*args, **kwargs)
+                    else:
+                        await drain()
                 except BaseException as error:
                     self._finalize_failure(error)
                     raise
-            return await helper(*args, **kwargs)
+                # See ``MessagesStreamWrapper._scoped_helper``.
+                self._finalize_success()
+            return result if drain is None else await helper(*args, **kwargs)
 
         return scoped
 
